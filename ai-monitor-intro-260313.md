@@ -9,10 +9,12 @@
 这是一套基于 Rockchip RK3576 工控机（ARM64，Linux 6.1.99）的**工业级智能视频监控系统**，具备：
 
 - 多路 RTSP 摄像头接入与视频分发
-- 基于 NPU 硬件加速的 AI 行为检测（离岗、吃香蕉等）
-- 插件化算法引擎，支持零代码新增行为检测
-- Web 管理界面（摄像头管理、任务管理、事件告警）
+- 基于 NPU 硬件加速的 AI 行为检测（离岗、吃香蕉、闭眼、打哈欠、PPE 合规、打电话/玩手机/抽烟等）
+- 插件化算法引擎，支持零代码新增行为检测，支持插件上传/删除
+- Web 管理界面（控制台、摄像头、任务、告警、算法模型、语音报警、报警上传）
 - 报警抓图存档与处理跟踪
+- **语音报警**：报警触发时通过摄像头喇叭播放对应语音（Java TTS）
+- **报警上传**：定时将新报警图片上传到指定服务器，断网续传
 
 ---
 
@@ -57,7 +59,9 @@
 1. 用户在前端添加摄像头 → Go 后端调 ZLM `addStreamProxy` → ZLM 拉 RTSP 并对外提供 HTTP-FLV
 2. 用户启动任务 → Go 后端调 Python `/api/task/start` → Python 调 C++ infer server 注册流 → C++ 独立拉 RTSP 做推理
 3. C++ 推理结果通过 ZeroMQ PUB 发布 → Python ZMQ SUB 接收 → 行为插件判断 → 写 alarms 表 + 存快照图
-4. 前端轮询 Go 后端 `/api/alarms` 显示告警记录
+4. 报警触发后：若配置了语音映射 → Python 调用 `voice_alarm` 调度器播放音频；新报警自动入队 `alarm_upload_queue`
+5. Go 后台上传 Worker 定时检查队列 → 将未上传报警（含图片）POST 到配置的 URL → 断网续传
+6. 前端轮询 Go 后端 `/api/alarms` 显示告警记录
 
 ---
 
@@ -124,15 +128,24 @@ curl "http://localhost/index/api/delStreamProxy?secret=vEq3Z2BobQevk5dRs1zZ6DahI
   "results": [{
     "task_name": "yolo_detect",
     "inference_time_ms": 15.6,
+    "result_type": "detections",
     "detections": [{
       "class_id": 0,
       "class_name": "person",
       "confidence": 0.89,
       "bbox": { "x1": 100.5, "y1": 200.3, "x2": 350.7, "y2": 650.1 }
+    }],
+    "faces": [{
+      "confidence": 0.95,
+      "bbox": { "x1": 100, "y1": 200, "x2": 350, "y2": 650 },
+      "ear": 0.28,
+      "mar": 0.35,
+      "eye_width_ratio": 0.8
     }]
   }]
 }
 ```
+`faces` 为可选字段，用于闭眼/打哈欠等需要 EAR/MAR 的插件；`ear`（眼宽比）、`mar`（嘴宽比）、`eye_width_ratio`（侧脸过滤）由人脸模型或后处理输出。
 
 **注意：** 使用 RKNN 推理时建议用 jemalloc 启动，避免与 glibc malloc 冲突：
 ```bash
@@ -158,16 +171,21 @@ ai-monitor-service/
 ├── main.py             # FastAPI 入口，lifespan 自动恢复 status=1 任务
 ├── config.py           # 配置（支持环境变量覆盖）
 ├── db.py               # aiosqlite 异步数据库访问
-├── schemas.py          # 内部数据结构（dataclass）
+├── schemas.py          # 内部数据结构（含 FaceMetric 人脸指标）
 ├── infer_client.py     # httpx 调用 C++ infer server HTTP API
 ├── zmq_subscriber.py   # pyzmq 异步 ZMQ 订阅器（单后台 task）
-├── task_manager.py     # 任务生命周期 + ZMQ 帧路由到插件
-├── alarm_manager.py    # 触发报警 → 抓图 → 写 DB
+├── task_manager.py    # 任务生命周期 + ZMQ 帧路由到插件
+├── alarm_manager.py    # 触发报警 → 抓图 → 写 DB → 触发语音报警
+├── voice_alarm.py      # 语音报警调度器（Java TTS，/home/hzhy/Audio）
 └── plugins/
     ├── __init__.py     # importlib 动态扫描注册插件
-    ├── base.py         # BehaviorPlugin 抽象基类（含状态机工具）
-    ├── no_person.py    # 离岗检测（已实现）
-    └── eat_banana.py   # 吃香蕉检测（已实现）
+    ├── base.py         # BehaviorPlugin 抽象基类（含 filter_valid_faces 人脸过滤）
+    ├── no_person.py    # 离岗检测
+    ├── eat_banana.py   # 吃香蕉检测
+    ├── eye_close.py    # 闭眼检测（EAR 阈值）
+    ├── yawning.py      # 打哈欠检测（MAR 上升沿 + 滑动窗口计数）
+    ├── ppe_detect.py   # PPE 合规（未戴安全帽/未戴口罩/未穿救生衣）
+    └── behavior_detect.py # 行为违规（打电话/玩手机/抽烟）
 ```
 
 **REST 接口：**
@@ -177,6 +195,9 @@ ai-monitor-service/
 | `/api/task/stop` | POST | 停止任务 |
 | `/api/task/running` | GET | 查询所有运行中任务 |
 | `/api/health` | GET | 服务健康状态 |
+| `/api/plugins` | GET | 列出插件文件（含 algo_key 解析） |
+| `/api/plugins` | POST | 上传插件 .py 文件 |
+| `/api/plugins/{filename}` | DELETE | 删除插件（禁止删除 base.py 等受保护文件） |
 
 **插件化设计（最重要的设计亮点）：**
 
@@ -187,8 +208,16 @@ ai-monitor-service/
 **已实现插件：**
 - `no_person`：连续 `duration` 秒区域内无人 → 报警
 - `eat_banana`：person + banana bbox 重叠持续 `duration` 秒 → 报警（避免桌上放香蕉误报）
+- `eye_close`：EAR < ear_threshold 持续 duration 秒 → 报警（支持 min_face_size、eye_width_ratio_threshold 人脸过滤）
+- `yawning`：MAR 上升沿计数，滑动窗口内达到 yawn_count 次 → 报警
+- `no_hardhat` / `no_mask` / `no_safety_vest`：PPE 违规检测（需专用模型输出对应类别）
+- `call` / `phone` / `smoke`：行为违规检测（需专用模型输出对应类别）
 
-**待实现（DB 中有配置，插件文件未创建）：** `play_phone`、`smoking`、`eye_close`、`yawning`
+**人脸检测支持：** C++ infer server 若输出 `faces`（含 EAR/MAR/eye_width_ratio），`frame_info.face_metrics` 会传给插件；基类 `filter_valid_faces()` 可过滤侧脸、过小人脸。
+
+**语音报警：** 启动时初始化 `voice_alarm` 调度器；报警触发后 `alarm_manager` 查询 `voice_alarm_algo_map` 获取音频文件名，调用 `scheduler.trigger(audio_file)`，由 Java jar 在 `/home/hzhy/Audio` 目录播放。
+
+**调试模式：** `python main.py --debug-face-metrics` 可周期性打印 ear/mar/eye_width_ratio 便于调参。
 
 ---
 
@@ -206,16 +235,20 @@ ai-monitor-service/
 **目录结构：**
 ```
 ai-monitor-backend/
-├── main.go               # Gin 路由 + CORS + DB 初始化
+├── main.go               # Gin 路由 + CORS + DB 初始化 + 后台上传 Worker
 ├── config/config.go      # 配置（支持环境变量覆盖）
-├── model/model.go        # 所有 struct（Camera, Task, Alarm, ZlmStream, Algorithm 等）
-├── store/store.go        # SQLite 全量 CRUD（含 zlm_streams 自动建表）
+├── model/model.go        # 所有 struct（含 VoiceAlarm、AlarmUpload 等）
+├── store/store.go        # SQLite 全量 CRUD（含 voice_alarm_algo_map、alarm_upload_queue 等）
 ├── zlm/client.go         # ZLM HTTP API 封装
 ├── pyservice/client.go   # Python 服务 HTTP 客户端
+├── uploader/uploader.go  # 报警上传后台 Worker（定时检查、断网续传）
 └── api/
     ├── camera.go         # 摄像头 CRUD + ZLM 流控制 + 摄像头截图代理
     ├── task.go           # 任务 CRUD + 启停（转 Python）+ 算法列表
-    └── alarm.go          # 告警分页查询 + 状态更新
+    ├── alarm.go          # 告警分页查询 + 状态更新
+    ├── algo_manage.go    # 算法模型管理（模型/算法/插件 CRUD、插件上传）
+    ├── voice_alarm.go    # 语音报警配置（开关、设备、算法-语音映射、音频文件）
+    └── alarm_upload.go   # 报警上传配置（开关、上传地址、队列、手动触发）
 ```
 
 **REST API 汇总：**
@@ -233,6 +266,27 @@ POST       /api/tasks/:id/stop           # 停止任务（→ Python）
 GET        /api/alarms                   # 告警列表（?task_id=&status=&page=&size=）
 PUT        /api/alarms/:id               # 更新告警状态
 GET        /api/health                   # 健康检查（含 ZLM/Python 连通性）
+
+# 算法模型管理（/api/algo-manage）
+GET/POST   /api/algo-manage/models       # 模型 CRUD
+PUT/DELETE /api/algo-manage/models/:id   # 模型更新/删除
+GET/POST   /api/algo-manage/algorithms   # 算法 CRUD（含 model_ids 关联）
+PUT/DELETE /api/algo-manage/algorithms/:id
+GET/POST   /api/algo-manage/plugins      # 插件列表/上传（转发 Python）
+DELETE    /api/algo-manage/plugins/:filename
+POST       /api/algo-manage/upload-file  # 模型文件上传
+
+# 语音报警（/api/voice-alarm）
+GET/PUT    /api/voice-alarm/settings     # 全局开关、设备 IP/用户/密码
+GET/PUT    /api/voice-alarm/algo-map/:algo_id   # 算法-语音映射
+DELETE     /api/voice-alarm/algo-map/:algo_id
+GET/POST   /api/voice-alarm/audio-files # 音频文件列表/上传
+DELETE     /api/voice-alarm/audio-files/:name
+
+# 报警上传（/api/alarm-upload）
+GET/PUT    /api/alarm-upload/settings    # 开关、上传地址、设备 ID
+GET        /api/alarm-upload/queue       # 上传队列（待上传/成功/失败）
+POST       /api/alarm-upload/run-now     # 立即执行一次上传
 ```
 
 **`/api/cameras/:id/snapshot` 实现说明：**
@@ -258,13 +312,13 @@ go build -o ai-monitor-backend .
 | **访问地址** | `http://localhost:5173` |
 | **技术栈** | Vite 4 + Vue3 + Element Plus + mpegts.js + Vue Router 4 + Pinia + axios |
 
-**四个功能页面：**
+**七个功能页面：**
 
 1. **控制台**（`src/views/Dashboard.vue`）
    - 左侧多画面预览区：支持 1×1 / 2×2 / 3×2 / 3×3 布局，每格可独立选择任务播放 HTTP-FLV
    - 右侧实时告警面板：今日/累计告警统计 + 最近 20 条滚动列表
 
-2. **摄像头管理**（`src/views/Cameras.vue`）
+2. **设备管理**（`src/views/Cameras.vue`）
    - 摄像头 CRUD（增删改查）
    - ZLM 推流启/停控制
    - 实时直播预览（mpegts.js 播放 HTTP-FLV）
@@ -282,6 +336,23 @@ go build -o ai-monitor-backend .
    - 按任务/状态筛选
    - 内联图片预览（报警快照）
    - 标记为已处理
+
+5. **算法模型**（`src/views/AlgoManage.vue`）
+   - **模型管理**：RKNN 模型 CRUD（路径、标签、阈值、输入尺寸等）
+   - **算法配置**：算法 CRUD、关联模型、param_definition 编辑
+   - **插件管理**：插件列表、上传 .py 文件、删除插件
+
+6. **语音报警**（`src/views/VoiceAlarm.vue`）
+   - 全局语音报警开关
+   - 发声设备配置（IP、用户名、密码，用于摄像头喇叭播放）
+   - 算法-语音映射：为每种算法选择对应音频文件
+   - 音频文件上传/管理
+
+7. **报警上传**（`src/views/AlarmUpload.vue`）
+   - 全局报警上传开关
+   - 上传配置（设备 ID、上传地址）
+   - 上传队列查看（待上传/成功/失败）
+   - 手动触发立即上传
 
 **组件：**
 - `src/components/VideoPlayer.vue`：mpegts.js 封装，hasAudio=false 绕过 PCMA 音频问题
@@ -336,6 +407,9 @@ r.NoRoute(func(c *gin.Context) {
 | `tasks` | 监控任务 | id, task_name, camera_id, status(0停/1运行/2异常), error_msg |
 | `task_algo_details` | 任务-算法配置 | task_id, algo_id, roi_config, algo_params(JSON), alarm_config(JSON) |
 | `alarms` | 报警记录 | task_id, algo_name, alarm_time, image_url, status(0未处理/1已处理), alarm_details |
+| `system_settings` | 系统配置（KV） | key, value（语音报警开关、设备 IP/用户/密码；报警上传开关、URL、设备 ID） |
+| `voice_alarm_algo_map` | 算法-语音映射 | algo_id, audio_file |
+| `alarm_upload_queue` | 报警上传队列 | alarm_id, status(0待上传/1成功/2失败), retry_count, last_error |
 
 **`algorithms.param_definition` 字段：** 算法参数的元数据 JSON 数组，前端据此动态渲染配置表单：
 ```json
@@ -494,6 +568,7 @@ class PlayPhonePlugin(BehaviorPlugin):
 ├── yolo11n-labels.txt            ← COCO 80 类标签
 ├── CLAUDE.md                     ← AI 助手速读文档（关键要点摘要）
 ├── ai-monitor-intro.md           ← 本文档（总体介绍）
+├── Audio/                        ← 语音报警音频目录（Java TTS jar + 音频文件）
 │
 ├── ZLMediaKit/                   ← ZLM 源码及可执行文件
 │   └── release/linux/Debug/MediaServer  ← ZLM 主程序
@@ -504,16 +579,18 @@ class PlayPhonePlugin(BehaviorPlugin):
 │
 ├── ai-monitor-service/           ← Python 算法调度服务
 │   ├── main.py                   ← FastAPI 入口（:9500）
+│   ├── voice_alarm.py            ← 语音报警调度器
 │   ├── plugins/                  ← 行为检测插件目录
 │   └── snapshots/                ← 报警抓图存储目录
 │
 ├── ai-monitor-backend/           ← Go REST 后端
 │   ├── main.go                   ← Gin 入口（:8090）
+│   ├── uploader/                 ← 报警上传后台 Worker
 │   ├── start.sh                  ← 一键启动脚本
 │   └── ai-monitor-backend        ← 编译产物（binary）
 │
 └── ai-monitor-frontend/          ← Vue3 前端
-    ├── src/views/                ← 三个主页面
+    ├── src/views/                ← 七个主页面（含 AlgoManage、VoiceAlarm、AlarmUpload）
     ├── start.sh                  ← 一键启动脚本（dev 模式）
     └── dist/                     ← 生产构建产物
 ```
