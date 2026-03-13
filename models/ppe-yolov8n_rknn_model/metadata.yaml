@@ -1,0 +1,27 @@
+description: Ultralytics ppe-YOLOv8n model trained on /content/drive/MyDrive/Project/Object_Detection/custom_colab.yaml
+author: Ultralytics
+date: '2026-03-12T22:36:53.079853'
+version: 8.3.235
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: Hardhat
+  1: Mask
+  2: NO-Hardhat
+  3: NO-Mask
+  4: NO-Safety Vest
+  5: Person
+  6: Safety Cone
+  7: Safety Vest
+  8: machinery
+  9: vehicle
+args:
+  batch: 1
+  name: rk3576
+channels: 3
