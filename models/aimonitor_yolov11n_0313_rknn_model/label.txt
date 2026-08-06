@@ -1,6 +1,0 @@
-person
-call
-phone
-smoke
-hardhat
-lifejacket
